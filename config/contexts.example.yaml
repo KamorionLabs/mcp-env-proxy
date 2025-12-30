@@ -1,0 +1,62 @@
+# MCP Environment Proxy - Contexts Configuration
+# Copy this file to contexts.yaml and customize for your environment
+
+# Default environment variables applied to all contexts
+defaults:
+  FASTMCP_LOG_LEVEL: ERROR
+
+# Available MCP server types
+servers:
+  eks:
+    command: uvx
+    args: ["awslabs.eks-mcp-server@latest"]
+  ecs:
+    command: uvx
+    args: ["awslabs.ecs-mcp-server@latest"]
+  cloudwatch:
+    command: uvx
+    args: ["awslabs.cloudwatch-logs-mcp-server@latest"]
+
+# Named contexts (like kubeconfig contexts)
+contexts:
+  # BigMat contexts
+  bigmat-eks-production:
+    server: eks
+    env:
+      AWS_PROFILE: WordPress-Production/AWSAdministratorAccess
+      AWS_REGION: eu-west-3
+
+  bigmat-eks-preproduction:
+    server: eks
+    env:
+      AWS_PROFILE: WordPress-Preproduction/AWSAdministratorAccess
+      AWS_REGION: eu-west-3
+
+  # Rubix contexts
+  rubix-eks-prd:
+    server: eks
+    env:
+      AWS_PROFILE: digital-webshop-prod/AWSAdministratorAccess
+      AWS_REGION: eu-central-1
+
+  rubix-eks-stg:
+    server: eks
+    env:
+      AWS_PROFILE: digital-webshop-stg/AWSAdministratorAccess
+      AWS_REGION: eu-central-1
+
+  # Homebox contexts (ECS)
+  homebox-ecs-production:
+    server: ecs
+    env:
+      AWS_PROFILE: homebox-production/AdministratorAccess
+      AWS_REGION: eu-west-3
+
+  homebox-ecs-staging:
+    server: ecs
+    env:
+      AWS_PROFILE: homebox-staging/AdministratorAccess
+      AWS_REGION: eu-west-3
+
+# Current active context (can be changed via switch_context tool)
+current_context: bigmat-eks-production
