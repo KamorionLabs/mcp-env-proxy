@@ -2,12 +2,11 @@
 
 import asyncio
 import logging
+import os
+import subprocess
+import json
 from dataclasses import dataclass, field
 from typing import Any
-
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.types import Tool
 
 from .config import ProxyConfig
 
@@ -15,20 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ManagedProcess:
-    """A managed MCP server process."""
-
-    context_name: str
-    session: ClientSession
-    tools: list[Tool] = field(default_factory=list)
-    _cleanup: Any = None  # Cleanup function from context manager
+class ToolInfo:
+    """Information about an available tool."""
+    name: str
+    description: str | None = None
+    input_schema: dict | None = None
 
 
 class ProcessPool:
-    """Manages a pool of MCP server processes.
+    """Manages MCP server process invocations.
 
-    Maintains connections to multiple MCP servers, one per context.
-    Allows switching between contexts without restarting processes.
+    For simplicity, spawns a fresh process for each tool call.
+    This avoids complex async context management issues.
     """
 
     def __init__(self, config: ProxyConfig, max_processes: int = 5):
@@ -36,144 +33,168 @@ class ProcessPool:
 
         Args:
             config: Proxy configuration
-            max_processes: Maximum number of concurrent processes
+            max_processes: Maximum number of concurrent processes (unused for now)
         """
         self.config = config
         self.max_processes = max_processes
-        self._processes: dict[str, ManagedProcess] = {}
         self._current_context: str | None = config.current_context
-        self._lock = asyncio.Lock()
+        self._tools_cache: dict[str, list[ToolInfo]] = {}
 
     @property
     def current_context(self) -> str | None:
         """Get the current active context."""
         return self._current_context
 
-    @property
-    def current_process(self) -> ManagedProcess | None:
-        """Get the current active process."""
-        if self._current_context is None:
-            return None
-        return self._processes.get(self._current_context)
-
-    async def get_or_create_process(self, context_name: str) -> ManagedProcess:
-        """Get an existing process or create a new one.
-
-        Args:
-            context_name: Name of the context
-
-        Returns:
-            ManagedProcess instance
-        """
-        async with self._lock:
-            # Return existing process if available
-            if context_name in self._processes:
-                logger.debug(f"Reusing existing process for context: {context_name}")
-                return self._processes[context_name]
-
-            # Evict oldest process if at capacity
-            if len(self._processes) >= self.max_processes:
-                await self._evict_oldest()
-
-            # Create new process
-            logger.info(f"Starting new process for context: {context_name}")
-            process = await self._spawn_process(context_name)
-            self._processes[context_name] = process
-            return process
-
-    async def _spawn_process(self, context_name: str) -> ManagedProcess:
-        """Spawn a new MCP server process.
-
-        Args:
-            context_name: Name of the context
-
-        Returns:
-            ManagedProcess instance
-        """
-        command, args = self.config.get_command(context_name)
-        env = self.config.build_env(context_name)
-
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env,
-        )
-
-        # Create the stdio client connection
-        read_stream, write_stream = await stdio_client(server_params).__aenter__()
-
-        # Create and initialize the session
-        session = ClientSession(read_stream, write_stream)
-        await session.__aenter__()
-        await session.initialize()
-
-        # Get available tools
-        tools_result = await session.list_tools()
-        tools = tools_result.tools if tools_result else []
-
-        logger.info(f"Process started for {context_name} with {len(tools)} tools")
-
-        return ManagedProcess(
-            context_name=context_name,
-            session=session,
-            tools=tools,
-        )
-
-    async def _evict_oldest(self) -> None:
-        """Evict the oldest process from the pool."""
-        if not self._processes:
-            return
-
-        # Don't evict the current context
-        candidates = [
-            name for name in self._processes.keys()
-            if name != self._current_context
-        ]
-
-        if not candidates:
-            logger.warning("Cannot evict: only current context in pool")
-            return
-
-        # Evict the first candidate (simple FIFO)
-        oldest = candidates[0]
-        await self._terminate_process(oldest)
-
-    async def _terminate_process(self, context_name: str) -> None:
-        """Terminate a process.
-
-        Args:
-            context_name: Name of the context
-        """
-        if context_name not in self._processes:
-            return
-
-        process = self._processes.pop(context_name)
-        logger.info(f"Terminating process for context: {context_name}")
-
-        try:
-            await process.session.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"Error terminating process: {e}")
-
-    async def switch_context(self, context_name: str) -> ManagedProcess:
+    async def switch_context(self, context_name: str) -> dict[str, Any]:
         """Switch to a different context.
 
         Args:
             context_name: Name of the context to switch to
 
         Returns:
-            ManagedProcess for the new context
+            Info about the new context including available tools
         """
         if context_name not in self.config.contexts:
             raise ValueError(f"Unknown context: {context_name}")
 
-        process = await self.get_or_create_process(context_name)
         self._current_context = context_name
         logger.info(f"Switched to context: {context_name}")
-        return process
+
+        # Fetch tools for the new context
+        tools = await self._fetch_tools(context_name)
+        self._tools_cache[context_name] = tools
+
+        return {
+            "context": context_name,
+            "tools": [{"name": t.name, "description": t.description} for t in tools],
+        }
+
+    async def _fetch_tools(self, context_name: str) -> list[ToolInfo]:
+        """Fetch available tools from an MCP server.
+
+        Args:
+            context_name: Name of the context
+
+        Returns:
+            List of available tools
+        """
+        # Use cached tools if available
+        if context_name in self._tools_cache:
+            return self._tools_cache[context_name]
+
+        command, args = self.config.get_command(context_name)
+        env = self.config.build_env(context_name)
+
+        # Build the MCP request for listing tools
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }
+
+        try:
+            result = await self._call_mcp_server(command, args, env, [
+                {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-env-proxy", "version": "0.1.0"}
+                }},
+                request
+            ])
+
+            if result and "tools" in result:
+                return [
+                    ToolInfo(
+                        name=t["name"],
+                        description=t.get("description"),
+                        input_schema=t.get("inputSchema")
+                    )
+                    for t in result["tools"]
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch tools for {context_name}: {e}")
+
+        return []
+
+    async def _call_mcp_server(
+        self,
+        command: str,
+        args: list[str],
+        env: dict[str, str],
+        requests: list[dict]
+    ) -> dict | None:
+        """Call an MCP server with JSON-RPC requests.
+
+        Args:
+            command: Command to run
+            args: Command arguments
+            env: Environment variables
+            requests: List of JSON-RPC requests to send
+
+        Returns:
+            Last response result or None
+        """
+        logger.debug(f"Calling MCP server: {command} {args}")
+
+        proc = await asyncio.create_subprocess_exec(
+            command, *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        try:
+            # Send requests one by one and read responses
+            results = []
+
+            for req in requests:
+                input_line = json.dumps(req) + "\n"
+                logger.debug(f"Sending: {input_line.strip()}")
+                proc.stdin.write(input_line.encode())
+                await proc.stdin.drain()
+
+            # Close stdin to signal end of input
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+
+            # Read all responses with timeout
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("MCP server timed out")
+
+            if stderr:
+                logger.debug(f"MCP server stderr: {stderr.decode()[:500]}")
+
+            # Parse responses - look for JSON lines
+            last_result = None
+            for line in stdout.decode().split("\n"):
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    response = json.loads(line)
+                    if "result" in response:
+                        last_result = response["result"]
+                    elif "error" in response:
+                        logger.error(f"MCP error: {response['error']}")
+                except json.JSONDecodeError:
+                    continue
+
+            return last_result
+
+        except Exception as e:
+            proc.kill()
+            raise RuntimeError(f"MCP server error: {e}")
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool on the current context's process.
+        """Call a tool on the current context's MCP server.
 
         Args:
             tool_name: Name of the tool to call
@@ -182,29 +203,43 @@ class ProcessPool:
         Returns:
             Tool result
         """
-        process = self.current_process
-        if process is None:
+        if self._current_context is None:
             raise RuntimeError("No active context. Use switch_context first.")
 
-        result = await process.session.call_tool(tool_name, arguments)
+        context_name = self._current_context
+        command, args = self.config.get_command(context_name)
+        env = self.config.build_env(context_name)
+
+        requests = [
+            {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-env-proxy", "version": "0.1.0"}
+            }},
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }}
+        ]
+
+        result = await self._call_mcp_server(command, args, env, requests)
         return result
 
-    async def list_tools(self) -> list[Tool]:
+    async def list_tools(self) -> list[ToolInfo]:
         """List tools available in the current context.
 
         Returns:
             List of available tools
         """
-        process = self.current_process
-        if process is None:
+        if self._current_context is None:
             return []
-        return process.tools
 
-    async def close(self) -> None:
-        """Close all processes in the pool."""
-        async with self._lock:
-            for context_name in list(self._processes.keys()):
-                await self._terminate_process(context_name)
+        if self._current_context in self._tools_cache:
+            return self._tools_cache[self._current_context]
+
+        tools = await self._fetch_tools(self._current_context)
+        self._tools_cache[self._current_context] = tools
+        return tools
 
     def list_contexts(self) -> list[dict[str, Any]]:
         """List all available contexts.
@@ -221,6 +256,6 @@ class ProcessPool:
                 "command": f"{server.command} {' '.join(server.args)}" if server else "unknown",
                 "env": ctx.env,
                 "active": name == self._current_context,
-                "loaded": name in self._processes,
+                "loaded": name in self._tools_cache,
             })
         return contexts

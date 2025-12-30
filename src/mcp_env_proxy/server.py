@@ -30,7 +30,7 @@ def create_server(config: ProxyConfig) -> FastMCP:
         """List all available contexts.
 
         Returns a list of contexts with their configuration,
-        showing which is currently active and which are loaded in memory.
+        showing which is currently active and which have cached tools.
         """
         return pool.list_contexts()
 
@@ -45,14 +45,9 @@ def create_server(config: ProxyConfig) -> FastMCP:
             context_name: Name of the context to switch to
 
         Returns:
-            Information about the new active context
+            Information about the new active context including available tools
         """
-        process = await pool.switch_context(context_name)
-        return {
-            "context": context_name,
-            "tools_available": len(process.tools),
-            "tool_names": [t.name for t in process.tools],
-        }
+        return await pool.switch_context(context_name)
 
     @mcp.tool()
     async def get_current_context() -> dict[str, Any]:
@@ -65,15 +60,15 @@ def create_server(config: ProxyConfig) -> FastMCP:
         if ctx_name is None:
             return {"context": None, "message": "No context active"}
 
-        process = pool.current_process
         ctx = config.get_context(ctx_name)
+        tools = await pool.list_tools()
 
         return {
             "context": ctx_name,
             "server": ctx.server if ctx else None,
             "env": ctx.env if ctx else {},
-            "tools_available": len(process.tools) if process else 0,
-            "tool_names": [t.name for t in process.tools] if process else [],
+            "tools_available": len(tools),
+            "tool_names": [t.name for t in tools],
         }
 
     @mcp.tool()
@@ -109,7 +104,7 @@ def create_server(config: ProxyConfig) -> FastMCP:
             {
                 "name": t.name,
                 "description": t.description,
-                "input_schema": t.inputSchema,
+                "input_schema": t.input_schema,
             }
             for t in tools
         ]
