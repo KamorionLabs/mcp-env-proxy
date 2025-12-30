@@ -20,10 +20,7 @@ def create_server(config: ProxyConfig) -> FastMCP:
     Returns:
         FastMCP server instance
     """
-    mcp = FastMCP(
-        name="mcp-env-proxy",
-        version="0.1.0",
-    )
+    mcp = FastMCP(name="mcp-env-proxy")
 
     # Initialize the process pool
     pool = ProcessPool(config)
