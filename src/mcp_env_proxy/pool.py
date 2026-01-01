@@ -2,10 +2,8 @@
 
 import asyncio
 import logging
-import os
-import subprocess
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .config import ProxyConfig
@@ -24,8 +22,8 @@ class ToolInfo:
 class ProcessPool:
     """Manages MCP server process invocations.
 
-    For simplicity, spawns a fresh process for each tool call.
-    This avoids complex async context management issues.
+    Uses interactive communication with MCP servers, reading responses
+    line by line as they arrive.
     """
 
     def __init__(self, config: ProxyConfig, max_processes: int = 5):
@@ -85,55 +83,71 @@ class ProcessPool:
         command, args = self.config.get_command(context_name)
         env = self.config.build_env(context_name)
 
-        # Build the MCP request for listing tools
-        request = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }
-
         try:
-            result = await self._call_mcp_server(command, args, env, [
-                {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            # Initialize first
+            init_request = {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {"name": "mcp-env-proxy", "version": "0.1.0"}
-                }},
-                request
-            ])
+                }
+            }
 
-            if result and "tools" in result:
-                return [
-                    ToolInfo(
-                        name=t["name"],
-                        description=t.get("description"),
-                        input_schema=t.get("inputSchema")
-                    )
-                    for t in result["tools"]
-                ]
+            tools_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }
+
+            result = await self._call_mcp_interactive(
+                command, args, env,
+                [init_request, tools_request],
+                expected_responses=2
+            )
+
+            # Look for tools/list response (id=1)
+            for resp in result:
+                if resp.get("id") == 1 and "result" in resp:
+                    tools_data = resp["result"].get("tools", [])
+                    return [
+                        ToolInfo(
+                            name=t["name"],
+                            description=t.get("description"),
+                            input_schema=t.get("inputSchema")
+                        )
+                        for t in tools_data
+                    ]
+
         except Exception as e:
             logger.error(f"Failed to fetch tools for {context_name}: {e}")
 
         return []
 
-    async def _call_mcp_server(
+    async def _call_mcp_interactive(
         self,
         command: str,
         args: list[str],
         env: dict[str, str],
-        requests: list[dict]
-    ) -> dict | None:
-        """Call an MCP server with JSON-RPC requests.
+        requests: list[dict],
+        expected_responses: int = 1,
+        timeout: float = 30.0
+    ) -> list[dict]:
+        """Call an MCP server interactively, reading responses as they arrive.
 
         Args:
             command: Command to run
             args: Command arguments
             env: Environment variables
             requests: List of JSON-RPC requests to send
+            expected_responses: Number of responses to wait for
+            timeout: Overall timeout in seconds
 
         Returns:
-            Last response result or None
+            List of JSON-RPC responses
         """
         logger.debug(f"Calling MCP server: {command} {args}")
 
@@ -145,49 +159,63 @@ class ProcessPool:
             env=env,
         )
 
-        try:
-            # Send requests one by one and read responses
-            results = []
+        responses = []
 
+        try:
+            async def read_responses():
+                """Read JSON responses from stdout."""
+                while len(responses) < expected_responses:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=timeout
+                    )
+                    if not line:
+                        break
+
+                    line_str = line.decode().strip()
+                    if not line_str or not line_str.startswith("{"):
+                        continue
+
+                    try:
+                        resp = json.loads(line_str)
+                        responses.append(resp)
+                        logger.debug(f"Received response id={resp.get('id')}")
+                    except json.JSONDecodeError:
+                        continue
+
+            # Start reading responses in background
+            read_task = asyncio.create_task(read_responses())
+
+            # Send all requests
             for req in requests:
                 input_line = json.dumps(req) + "\n"
-                logger.debug(f"Sending: {input_line.strip()}")
+                logger.debug(f"Sending request id={req.get('id')}")
                 proc.stdin.write(input_line.encode())
                 await proc.stdin.drain()
+                # Small delay between requests
+                await asyncio.sleep(0.1)
 
-            # Close stdin to signal end of input
-            proc.stdin.close()
-            await proc.stdin.wait_closed()
-
-            # Read all responses with timeout
+            # Wait for responses with timeout
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=30.0
-                )
+                await asyncio.wait_for(read_task, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for responses, got {len(responses)}/{expected_responses}")
+
+            # Close stdin and terminate
+            proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.stdin.wait_closed(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+            # Kill process
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 proc.kill()
-                raise RuntimeError("MCP server timed out")
 
-            if stderr:
-                logger.debug(f"MCP server stderr: {stderr.decode()[:500]}")
-
-            # Parse responses - look for JSON lines
-            last_result = None
-            for line in stdout.decode().split("\n"):
-                line = line.strip()
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    response = json.loads(line)
-                    if "result" in response:
-                        last_result = response["result"]
-                    elif "error" in response:
-                        logger.error(f"MCP error: {response['error']}")
-                except json.JSONDecodeError:
-                    continue
-
-            return last_result
+            return responses
 
         except Exception as e:
             proc.kill()
@@ -210,20 +238,43 @@ class ProcessPool:
         command, args = self.config.get_command(context_name)
         env = self.config.build_env(context_name)
 
-        requests = [
-            {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        init_request = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "mcp-env-proxy", "version": "0.1.0"}
-            }},
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            }
+        }
+
+        tool_request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
                 "name": tool_name,
                 "arguments": arguments
-            }}
-        ]
+            }
+        }
 
-        result = await self._call_mcp_server(command, args, env, requests)
-        return result
+        responses = await self._call_mcp_interactive(
+            command, args, env,
+            [init_request, tool_request],
+            expected_responses=2,
+            timeout=60.0  # Longer timeout for tool calls
+        )
+
+        # Look for tools/call response (id=1)
+        for resp in responses:
+            if resp.get("id") == 1:
+                if "result" in resp:
+                    return resp["result"]
+                elif "error" in resp:
+                    raise RuntimeError(f"Tool error: {resp['error']}")
+
+        raise RuntimeError("No response received for tool call")
 
     async def list_tools(self) -> list[ToolInfo]:
         """List tools available in the current context.
